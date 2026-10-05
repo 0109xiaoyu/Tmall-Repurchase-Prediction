@@ -1,176 +1,133 @@
 import pandas as pd
 import numpy as np
-
-# 读取大文件的函数
-def read_local(file_name, chunk_size=500000):
-    reader = pd.read_csv(file_name, iterator=True, header=0)
-    chunks = []
-    loop = True
-    while loop:
-        try:
-            chunk = reader.get_chunk(chunk_size)
-            chunks.append(chunk)
-        except:
-            loop = False
-            print('数据获取完毕！')
-    df = pd.concat(chunks, ignore_index=True)
-    return df
+from sklearn.model_selection import KFold
 
 # 读取数据
 train = pd.read_csv('train_format1.csv')
-test = pd.read_csv('test_format1.csv', usecols=['user_id','merchant_id'])
+test = pd.read_csv('test_format1.csv', usecols=['user_id', 'merchant_id'])
 user_info = pd.read_csv('userinfo.csv')
-user_log = read_local(file_name='userlog.csv')
 
+
+def read_local(file_name, chunk_size=500000):
+    reader = pd.read_csv(file_name, iterator=True, header=0)
+    chunks = []
+    while True:
+        try:
+            chunk = reader.get_chunk(chunk_size)
+            chunks.append(chunk)
+        except StopIteration:
+            break
+    return pd.concat(chunks, ignore_index=True)
+
+
+user_log = read_local('userlog.csv')
+
+# 基础类型转换
 user_log['item_id'] = user_log['item_id'].astype('int32')
 user_log['cat_id'] = user_log['cat_id'].astype('int32')
 user_log['brand_id'] = user_log['brand_id'].astype('int32')
 user_log['action_type'] = user_log['action_type'].astype('int8')
-
-# 把要用到的用户和商家筛选出来
-matrix = pd.concat([train, test], axis=0)
-user_log = pd.merge(user_log, matrix[['user_id','merchant_id']],
-                    on=['user_id','merchant_id'], how='inner')
-
-# 修改数据格式
-# 修复：避免链式赋值
-user_log['brand_id'] = user_log['brand_id'].fillna(0)
 user_log['time_stamp'] = pd.to_datetime(user_log['time_stamp'], format='%m%d')
 
-# matrix添加年龄和性别特征
-matrix = pd.merge(matrix, user_info, on='user_id', how='left')
+# 筛选用户和商家
+matrix = pd.concat([train, test], axis=0)
+user_log = pd.merge(user_log, matrix[['user_id', 'merchant_id']],
+                    on=['user_id', 'merchant_id'], how='inner')
 
-# 数据格式转换
-matrix['label'] = matrix['label'].astype(str)
-matrix['age_range'] = matrix['age_range'].astype('int8')
-# 修复：避免链式赋值
-matrix['gender'] = matrix['gender'].fillna(2)
-matrix['gender'] = matrix['gender'].astype('int8')
-matrix.head()
 
-# 用户在平台的总交互次数
-groups = user_log.groupby(by='user_id')
-temp = groups.size().reset_index()
-temp.rename(columns={0:'user_num'}, inplace=True)
-matrix = pd.merge(matrix, temp, on='user_id', how='left')
-matrix.head()
+def build_features(df):
+    user_feat = df.groupby('user_id').agg(
+        user_num=('item_id', 'size'),
+        user_days=('time_stamp', lambda x: (x.max() - x.min()).days),
+        item_num=('item_id', 'nunique'),
+        cat_num=('cat_id', 'nunique'),
+        brand_num=('brand_id', 'nunique'),
+        merchant_num=('merchant_id', 'nunique')
+    ).reset_index()
+    action_pivot = pd.pivot_table(df, index='user_id', columns='action_type',
+                                  aggfunc='size', fill_value=0).reset_index()
+    action_pivot.columns = ['user_id', 'uclick_num', 'uadd_num', 'ubuy_num', 'usave_num']
+    user_feat = pd.merge(user_feat, action_pivot, on='user_id', how='left')
+    user_feat['user_buy_rate'] = user_feat['ubuy_num'] / (user_feat['uclick_num'] + 1)
 
-# 用户最近一次购买距离第一次的时长
-temp = groups['time_stamp'].agg([('F_time','min'),('L_time','max')])
-temp.reset_index(inplace=True)
-temp['user_days'] = (temp['L_time']-temp['F_time']).dt.days
-matrix = pd.merge(matrix, temp[['user_id','user_days']], on='user_id', how='left')
-matrix.head()
+    merchant_feat = df.groupby('merchant_id').agg(
+        merchant_benum=('item_id', 'size'),
+        merchant_user=('user_id', 'nunique'),
+        merchant_item=('item_id', 'nunique'),
+        merchant_cat=('cat_id', 'nunique'),
+        merchant_brand=('brand_id', 'nunique')
+    ).reset_index()
+    m_action_pivot = pd.pivot_table(df, index='merchant_id', columns='action_type',
+                                    aggfunc='size', fill_value=0).reset_index()
+    m_action_pivot.columns = ['merchant_id', 'mclick_num', 'mbuy_num', 'madd_num', 'msave_num']
+    merchant_feat = pd.merge(merchant_feat, m_action_pivot, on='merchant_id', how='left')
+    merchant_feat['merchant_buy_rate'] = merchant_feat['mbuy_num'] / (merchant_feat['mclick_num'] + 1)
 
-# 用户对不同【商品、品类、品牌、商家】的交互次数
-merfeature = ['user_id', 'item_id', 'cat_id',  'brand_id', 'merchant_id']
-xsum = lambda x: len(x.unique())
-inmerchant = user_log[merfeature].groupby(by='user_id').agg(xsum)
-inmerchant.reset_index(inplace=True)
-inmerchant.columns = ['user_id','item_num','cat_num','brand_num','merchant_num']
-matrix = pd.merge(matrix, inmerchant, on='user_id', how='left')
-matrix.head()
+    cross_feat = df.groupby(['user_id', 'merchant_id']).agg(
+        user_merchant=('item_id', 'size'),
+        user_merchant_item=('item_id', 'nunique'),
+        user_merchant_cat=('cat_id', 'nunique'),
+        user_merchant_brand=('brand_id', 'nunique'),
+        user_merchant_days=('time_stamp', lambda x: (x.max() - x.min()).days)
+    ).reset_index()
+    c_action_pivot = pd.pivot_table(df, index=['user_id', 'merchant_id'], columns='action_type',
+                                    aggfunc='size', fill_value=0).reset_index()
+    c_action_pivot.columns = ['user_id', 'merchant_id', 'user_merchant_click', 'user_merchant_add', 'user_merchant_buy',
+                              'user_merchant_save']
+    cross_feat = pd.merge(cross_feat, c_action_pivot, on=['user_id', 'merchant_id'], how='left')
+    cross_feat['user_merchant_buy_rate'] = cross_feat['user_merchant_buy'] / (cross_feat['user_merchant_click'] + 1)
+    return user_feat, merchant_feat, cross_feat
 
-# 用户进行【点击、加购物车、购买、收藏】的次数
-temp = pd.pivot_table(user_log[['user_id','action_type']],
-               index='user_id', columns='action_type',aggfunc=np.count_nonzero, fill_value=0)
-temp.reset_index(inplace=True)
-temp.columns = ['user_id','uclick_num','uadd_num','ubuy_num','usave_num']
-matrix = pd.merge(matrix, temp, on='user_id', how='left')
-matrix.head()
 
-# 用户的购买率=购买次数/点击次数
-matrix['user_buy_rate'] = matrix['ubuy_num']/(matrix['uclick_num']+1)
-matrix.head()
+train_user_feat, train_merchant_feat, train_cross_feat = build_features(user_log)
+test_user_feat, test_merchant_feat, test_cross_feat = build_features(user_log)
 
-# 商家被交互的数量
-groups = user_log.groupby(by='merchant_id')
-temp = groups.size().reset_index()
-temp.rename(columns={0:'merchant_benum'}, inplace=True)
-matrix = pd.merge(matrix, temp, on='merchant_id', how='left')
-matrix.head()
 
-# 商家被交互的【商品、品类、品牌】的数量；与商家交互的用户数量
-# 修复：多列选择用列表
-temp = groups[['user_id', 'item_id','cat_id','brand_id']].agg(xsum)
-temp.reset_index(inplace=True)
-temp.columns = ['merchant_id','merchant_user','merchant_item','merchant_cat','merchant_brand']
-matrix = pd.merge(matrix, temp, on='merchant_id', how='left')
-matrix.head()
+def merge_features(base_df, user_f, merchant_f, cross_f):
+    df = pd.merge(base_df, user_info, on='user_id', how='left')
+    df = pd.merge(df, user_f, on='user_id', how='left')
+    df = pd.merge(df, merchant_f, on='merchant_id', how='left')
+    df = pd.merge(df, cross_f, on=['user_id', 'merchant_id'], how='left')
+    return df
 
-# 商家【被点击、被加购物车、被购买、被收藏】的次数
-temp = pd.pivot_table(user_log[['merchant_id','action_type']],
-                      index='merchant_id',columns='action_type',
-                      aggfunc=np.count_nonzero, fill_value=0)
-temp.reset_index(inplace=True)
-temp.columns = ['merchant_id','mclick_num','mbuy_num','madd_num','msave_num']
-matrix = pd.merge(matrix, temp, on='merchant_id', how='left')
-matrix.head()
 
-# 商家的复购次数
-temp = pd.DataFrame(train.loc[train['label']==1, 'merchant_id'].value_counts())
-temp.reset_index(inplace=True)
-temp.columns = ['merchant_id','merchant_rebuy']
-matrix = pd.merge(matrix, temp, on='merchant_id', how='left')
-matrix.head()
+train_df = merge_features(train, train_user_feat, train_merchant_feat, train_cross_feat)
+test_df = merge_features(test, test_user_feat, test_merchant_feat, test_cross_feat)
 
-# 商家的被购买率
-matrix['merchant_buy_rate'] = matrix['mbuy_num']/(matrix['mclick_num']+1)
-matrix.head()
+# ================= 防泄露：K折交叉目标编码 =================
+train_df['merchant_rebuy'] = 0.0
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+global_rebuy_mean = train_df.loc[train_df['label'] == 1, 'merchant_id'].value_counts() / train_df[
+    'merchant_id'].value_counts()
+global_rebuy_mean = global_rebuy_mean.fillna(0)
 
-# 用户在商家的交互次数
-groups = user_log.groupby(by=['user_id','merchant_id'])
-temp = groups.size().reset_index()
-temp.rename(columns={0:'user_merchant'}, inplace=True)
-matrix = pd.merge(matrix, temp, on=['user_id','merchant_id'], how='left')
-matrix.head()
+for train_idx, val_idx in kf.split(train_df):
+    rebuy_count = train_df.iloc[train_idx].loc[train_df.iloc[train_idx]['label'] == 1, 'merchant_id'].value_counts()
+    total_count = train_df.iloc[train_idx]['merchant_id'].value_counts()
+    rebuy_rate = (rebuy_count / total_count).fillna(0)
+    val_merchants = train_df.iloc[val_idx]['merchant_id']
+    train_df.loc[train_df.index[val_idx], 'merchant_rebuy'] = val_merchants.map(rebuy_rate).fillna(0)
 
-# 用户对商家的【商品、品类、品牌】的交互次数(唯一数量)
-# 修复：多列选择用列表
-temp = groups[['item_id','cat_id','brand_id']].agg(xsum)
-temp.columns = ['user_merchant_item','user_merchant_cat','user_merchant_brand']
-temp.reset_index(inplace=True)
-matrix = pd.merge(matrix, temp, on=['user_id','merchant_id'], how='left')
-matrix.head()
+test_df['merchant_rebuy'] = test_df['merchant_id'].map(global_rebuy_mean).fillna(0)
 
-# 用户对商家【点击、加购物车、购买、收藏】的次数
-temp = pd.pivot_table(user_log[['user_id','merchant_id','action_type']],
-                      index=['user_id','merchant_id'], columns='action_type',
-                      aggfunc=np.count_nonzero, fill_value=0)
-temp.columns = ['user_merchant_click','user_merchant_add','user_merchant_buy','user_merchant_save']
-temp.reset_index(inplace=True)
-matrix = pd.merge(matrix, temp, on=['user_id','merchant_id'], how='left')
-matrix.head()
+# 处理离散特征和缺失值
+for df in [train_df, test_df]:
+    df['age_range'] = df['age_range'].astype('int8')
+    df['gender'] = df['gender'].fillna(2).astype('int8')
+    df = df.fillna(0)
 
-# 不同用户在不同商家购买率=购买次数/点击次数
-temp['user_merchant_buy_rate'] = temp['user_merchant_buy']/(temp['user_merchant_click']+1)
-matrix = pd.merge(matrix, temp[['user_id','merchant_id','user_merchant_buy_rate']],
-                  on=['user_id','merchant_id'], how='left')
-matrix.head()
+# 独热编码
+train_df = pd.get_dummies(train_df, columns=['age_range', 'gender'], prefix=['age', 'g'])
+test_df = pd.get_dummies(test_df, columns=['age_range', 'gender'], prefix=['age', 'g'])
 
-# 用户在该商家的最近一次购买距离第一次的时长
-temp = groups['time_stamp'].agg([('first','min'),('last','max')])
-temp['user_merchant_days'] = (temp['last']-temp['first']).dt.days
-temp.reset_index(inplace=True)
-del temp['first'], temp['last']
-matrix = pd.merge(matrix, temp, on=['user_id','merchant_id'], how='left')
-matrix.head()
+missing_cols = set(train_df.columns) - set(test_df.columns)
+for c in missing_cols:
+    test_df[c] = 0
+test_df = test_df[train_df.columns]
 
-# 离散型特征age_range，gender特征处理
-temp = pd.get_dummies(matrix['age_range'], prefix='age')
-matrix = pd.concat([matrix, temp], axis=1)
-del matrix['age_range']
-
-temp = pd.get_dummies(matrix['gender'], prefix='g')
-matrix = pd.concat([matrix, temp], axis=1)
-del matrix['gender']
-
-# 分割训练集和测试集
-matrix.fillna(0, inplace=True)
-train_data =  matrix[matrix['label']!='nan']
-test_data = matrix[matrix['label']=='nan']
-del test_data['label']
-
-# 数据写出
-train_data.to_csv('train.csv', index=None)
-test_data.to_csv('test.csv', index=None)
+train_df.to_csv('train_clean.csv', index=None)
+test_df.to_csv('test_clean.csv', index=None)
+print("【特征工程完成】")
+print(f"训练集维度：{train_df.shape}")
+print(f"测试集维度：{test_df.shape}")
+print("已保存 train_clean.csv 和 test_clean.csv\n")

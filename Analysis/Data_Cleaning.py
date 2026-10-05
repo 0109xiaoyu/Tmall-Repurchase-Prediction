@@ -5,38 +5,24 @@ train = pd.read_csv('train_format1.csv')
 test = pd.read_csv('test_format1.csv', usecols=['user_id','merchant_id'])
 user_info = pd.read_csv('user_info_format1.csv')
 
-# 数据量太大，直接读取可能会导致内存溢出
-# user_log = pd.read_csv('user_log_format1.csv')
+# 分块读取大文件
 def read_local(file_name, chunk_size=500000):
-    # 读取为可迭代的TextFileReader对象
     reader = pd.read_csv(file_name, iterator=True, header=0)
     chunks = []
-    loop = True
-    while loop:
+    while True:
         try:
-            # 每一次按500000行获取数据
             chunk = reader.get_chunk(chunk_size)
             chunks.append(chunk)
-        except:
-            loop = False
-            print('数据获取完毕！')
-    # 把列表的数据合并为数据框
-    df = pd.concat(chunks, ignore_index=True)
-    return df
+        except StopIteration:
+            break
+    return pd.concat(chunks, ignore_index=True)
 
-# 通过函数，分块读取
-user_log = read_local(file_name='user_log_format1.csv', chunk_size=500000)
+user_log = read_local('user_log_format1.csv')
 
-test.isna().sum()
-train.isna().sum()
-user_info.isna().sum()
-user_log.isna().sum()
-user_log.duplicated().sum()
-
-# 缺失值填补
-user_info['age_range'].fillna(0, inplace=True)
-user_info['gender'].fillna(2, inplace=True)
-user_log['brand_id'].fillna(0, inplace=True)
+# 缺失值填补（修复 FutureWarning）
+user_info['age_range'] = user_info['age_range'].fillna(0)
+user_info['gender'] = user_info['gender'].fillna(2)
+user_log['brand_id'] = user_log['brand_id'].fillna(0)
 
 # 去重
 user_log.drop_duplicates(inplace=True)
@@ -47,3 +33,7 @@ user_log.rename(columns={'seller_id':'merchant_id'}, inplace=True)
 # 数据保存
 user_info.to_csv('userinfo.csv', index=None)
 user_log.to_csv('userlog.csv', index=None)
+print("【数据清洗完成】")
+print(f"用户信息数据：{user_info.shape[0]} 行，{user_info.shape[1]} 列")
+print(f"用户行为日志：{user_log.shape[0]} 行，{user_log.shape[1]} 列")
+print("已保存 userinfo.csv 和 userlog.csv\n")

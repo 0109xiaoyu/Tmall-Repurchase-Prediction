@@ -1,119 +1,75 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import lightgbm
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, confusion_matrix, classification_report
 import joblib
-import shap
-import warnings
 
-# 忽略一些版本警告
-warnings.filterwarnings('ignore')
+train = pd.read_csv('train_clean.csv')
+test = pd.read_csv('test_clean.csv')
 
-# ================= 1. 环境与数据准备 =================
-# 解决 Windows 系统下 Matplotlib 中文显示乱码问题
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
+features = [col for col in train.columns if col not in ['user_id', 'merchant_id', 'label']]
+X = train[features]
+y = train['label']
+groups = train['user_id']
 
-print("正在加载模型与数据...")
-# 加载实训4保存的模型和标准化器
-model_lgb = joblib.load('lgb_model.pkl')
-sc = joblib.load('scaler.pkl')
+# 下采样处理不平衡
+n = sum(y == 1)
+pos_idx = y[y == 0].sample(n, random_state=123).index
+neg_idx = y[y == 1].index
+X_balanced = X.loc[pos_idx.union(neg_idx)]
+y_balanced = y.loc[pos_idx.union(neg_idx)]
+groups_balanced = groups.loc[pos_idx.union(neg_idx)]
 
-# 读取训练集，准备和实训4完全一致的验证集
-train = pd.read_csv('train.csv')
-n = sum(train['label'] == 1)
-posdata = train[train['label'] == 0].sample(n, random_state=123)
-negdata = train[train['label'] == 1]
-data = pd.concat([posdata, negdata], axis=0)
+gkf = GroupKFold(n_splits=5)
+auc_scores = []
+f1_scores = []
+best_model = None
 
-# 提取特征列（排除 ID 和 label）
-features = [col for col in data.columns if col not in ['user_id', 'merchant_id', 'label']]
-X = sc.transform(data[features])  # 必须是 transform，复用实训4的标准化器
-y = data['label']
+print("【开始 GroupKFold 交叉验证...】")
+for fold, (train_idx, val_idx) in enumerate(gkf.split(X_balanced, y_balanced, groups_balanced)):
+    X_train, X_val = X_balanced.iloc[train_idx], X_balanced.iloc[val_idx]
+    y_train, y_val = y_balanced.iloc[train_idx], y_balanced.iloc[val_idx]
 
-# 重新划分验证集（必须和实训4的参数一模一样，否则数据对不上）
-from sklearn.model_selection import train_test_split
-xtrain, xval, ytrain, yval = train_test_split(
-    X, y, test_size=0.2, random_state=2021
-)
+    sc = StandardScaler()
+    X_train_scaled = sc.fit_transform(X_train)
+    X_val_scaled = sc.transform(X_val)
 
-print(f"验证集大小: {xval.shape}")
+    model = lightgbm.LGBMClassifier(
+        n_estimators=1000, max_depth=8, num_leaves=25,
+        colsample_bytree=0.5, learning_rate=0.1, metric='auc',
+        random_state=42
+    )
+    model.fit(
+        X_train_scaled, y_train,
+        eval_metric='auc',
+        eval_set=[(X_train_scaled, y_train), (X_val_scaled, y_val)],
+        callbacks=[lightgbm.early_stopping(stopping_rounds=100), lightgbm.log_evaluation(period=0)]
+    )
 
-# ================= 2. SHAP 可解释性分析 =================
-print("\n开始计算 SHAP 值（可能需要1-2分钟，请耐心等待）...")
-# 为了防止内存溢出，只抽样 1000 个样本进行 SHAP 解释
-sample_idx = np.random.choice(xval.shape[0], size=1000, replace=False)
-xval_sample = xval[sample_idx]
+    y_pred_prob = model.predict_proba(X_val_scaled)[:, 1]
+    y_pred = model.predict(X_val_scaled)
+    auc = roc_auc_score(y_val, y_pred_prob)
+    f1 = f1_score(y_val, y_pred)
+    auc_scores.append(auc)
+    f1_scores.append(f1)
+    print(f"Fold {fold + 1} | AUC: {auc:.4f} | F1: {f1:.4f}")
 
-# 构建树模型解释器
-explainer = shap.TreeExplainer(model_lgb)
-shap_values = explainer.shap_values(xval_sample)
+    if fold == 4:
+        best_model = model
+        final_sc = sc
 
-# 兼容不同版本的 SHAP：二分类模型有时会返回一个包含两个数组的 list
-if isinstance(shap_values, list):
-    shap_values = shap_values[1]  # 取类别1（复购）的 SHAP 值
+print(f"\n【模型评估结果】")
+print(f"交叉验证平均 AUC: {np.mean(auc_scores):.4f} (+/- {np.std(auc_scores):.4f})")
+print(f"交叉验证平均 F1: {np.mean(f1_scores):.4f} (+/- {np.std(f1_scores):.4f})")
 
-# 绘制 SHAP 摘要图
-plt.figure(figsize=(10, 8))
-shap.summary_plot(shap_values, xval_sample, feature_names=features, show=False)
-plt.title('特征对复购预测的 SHAP 值影响 (Top特征)', fontsize=16)
-plt.tight_layout()
-plt.savefig('shap_summary.png', dpi=300, bbox_inches='tight')
-plt.show()
-print("SHAP 摘要图已保存为 'shap_summary.png'")
+joblib.dump(best_model, 'lgb_model_no_leak.pkl')
+joblib.dump(final_sc, 'scaler_no_leak.pkl')
 
-# ================= 3. Lift 提升曲线（业务评估） =================
-print("\n正在计算 Lift 曲线...")
-# 预测验证集概率
-y_pred_proba = model_lgb.predict_proba(xval)[:, 1]
-
-# 构建 DataFrame 并按概率降序排序
-df_eval = pd.DataFrame({'y_true': yval, 'y_prob': y_pred_proba})
-df_eval = df_eval.sort_values(by='y_prob', ascending=False).reset_index(drop=True)
-
-# 计算累计正例和累计增益
-df_eval['cumulative_positives'] = df_eval['y_true'].cumsum()
-df_eval['total_positives'] = df_eval['y_true'].sum()
-df_eval['cumulative_gain'] = df_eval['cumulative_positives'] / df_eval['total_positives']
-
-# 计算 Lift
-overall_positive_rate = df_eval['y_true'].mean()
-df_eval['percentile'] = df_eval.index / len(df_eval)
-df_eval['lift'] = (df_eval['cumulative_positives'] / (df_eval.index + 1)) / overall_positive_rate
-
-# 绘制 Lift 曲线
-plt.figure(figsize=(8, 6))
-plt.plot(df_eval['percentile'], df_eval['lift'], label='模型 Lift', color='r', linewidth=2)
-plt.axhline(y=1, color='b', linestyle='--', label='随机猜测基准线 (Lift=1)')
-plt.title('Lift 曲线 (提升曲线) - 业务效果评估', fontsize=14)
-plt.xlabel('样本百分比 (按预测概率降序)')
-plt.ylabel('Lift (提升倍数)')
-plt.legend()
-plt.grid(True)
-plt.savefig('lift_curve.png', dpi=300, bbox_inches='tight')
-plt.show()
-
-# 打印关键业务指标 (Top 10% 和 Top 20%)
-for p in [0.1, 0.2]:
-    idx = int(len(df_eval) * p)
-    lift_val = df_eval.loc[idx, 'lift']
-    gain_val = df_eval.loc[idx, 'cumulative_gain']
-    print(f"【业务指标】Top {int(p*100)}% 的用户 -> 覆盖了 {gain_val*100:.2f}% 的复购用户，效率提升了 {lift_val:.2f} 倍。")
-
-# ================= 4. 业务落地：高潜用户名单 =================
-print("\n正在生成测试集的高潜用户名单...")
-# 读取测试集
-test = pd.read_csv('test.csv')
-# 提取测试集特征并进行标准化（必须用训练集的 sc）
-test_features = sc.transform(test[features])
-# 预测概率
-test['prob'] = model_lgb.predict_proba(test_features)[:, 1]
-
-# 筛选预测概率 > 0.7 的高潜用户（可根据业务需要调整阈值）
-high_potential = test[test['prob'] > 0.7][['user_id', 'merchant_id', 'prob']]
-high_potential = high_potential.sort_values(by='prob', ascending=False)
-
-# 导出名单
-high_potential.to_csv('high_potential_users.csv', index=False)
-print(f"已生成高潜用户名单，共 {len(high_potential)} 人，保存为 'high_potential_users.csv'。")
-print("\n====== 执行完毕！======")
+# 测试集预测
+test_features = test[features]
+test_scaled = final_sc.transform(test_features)
+test['prob'] = best_model.predict_proba(test_scaled)[:, 1]
+test[['user_id', 'merchant_id', 'prob']].to_csv('prediction_no_leak.csv', index=None)
+print("模型训练完成，预测结果已保存 prediction_no_leak.csv\n")
