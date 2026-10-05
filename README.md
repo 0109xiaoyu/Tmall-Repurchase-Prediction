@@ -2,7 +2,7 @@
 
 > 基于百万级用户行为日志的多维特征工程、LightGBM分类建模与SHAP解释性分析 —— 从数据清洗、特征构建、不平衡样本处理到模型可解释性与业务落地的完整数据挖掘闭环
 
-[![Python](https://img.shields.io/badge/Python-3.x-blue)]()
+[![Python](https://img.shields.io/badge/Python-3.12-blue)]()
 [![LightGBM](https://img.shields.io/badge/LightGBM-分类模型-green)]()
 [![SHAP](https://img.shields.io/badge/SHAP-可解释性-orange)]()
 [![Scikit-Learn](https://img.shields.io/badge/ScikitLearn-机器学习-red)]()
